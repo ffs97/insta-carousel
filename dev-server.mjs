@@ -72,6 +72,27 @@ const PUBLIC_CDN_URLS = {
 const PORT = Number(process.env.PORT || 5173);
 const FFMPEG_BIN = process.env.FFMPEG_PATH || 'ffmpeg';
 
+// Persistent temp cache directory for original source videos and lightweight stage proxies
+const SESSION_MEDIA_DIR = path.join(os.tmpdir(), 'carouselflow_media_cache');
+try {
+  fs.mkdirSync(SESSION_MEDIA_DIR, { recursive: true });
+} catch {}
+
+/**
+ * Maps serverVideoId -> {
+ *   serverVideoId: string,
+ *   sourcePath: string,
+ *   proxyPath: string,
+ *   width: number,
+ *   height: number,
+ *   proxyWidth: number,
+ *   proxyHeight: number,
+ *   duration: number,
+ *   hasAudio: boolean,
+ * }
+ */
+const uploadedVideos = new Map();
+
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -352,6 +373,566 @@ async function handleNormalizeVideo(req, res) {
   }
 }
 
+function parseFfmpegVideoMetadata(stderrText) {
+  let duration = 5;
+  const durMatch = stderrText.match(
+    /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/i
+  );
+  if (durMatch) {
+    const hrs = parseInt(durMatch[1], 10) || 0;
+    const mins = parseInt(durMatch[2], 10) || 0;
+    const secs = parseFloat(durMatch[3]) || 0;
+    const total = hrs * 3600 + mins * 60 + secs;
+    if (total > 0) duration = total;
+  }
+
+  const inputSection = stderrText.split(/Output #0/i)[0] || stderrText;
+  const outputSection = stderrText.split(/Output #0/i)[1] || '';
+
+  const hasAudio = /Stream #\d+:\d+.*Audio:/i.test(inputSection);
+
+  let rawSourceW = 1440;
+  let rawSourceH = 1800;
+  const inDimMatch = inputSection.match(
+    /Stream #\d+:\d+.*Video:.*?\s(\d{2,5})x(\d{2,5})(?:[\s,]|$)/i
+  );
+  if (inDimMatch) {
+    rawSourceW = parseInt(inDimMatch[1], 10) || 1440;
+    rawSourceH = parseInt(inDimMatch[2], 10) || 1800;
+  }
+
+  let proxyW = rawSourceW;
+  let proxyH = rawSourceH;
+  const outDimMatch = outputSection.match(
+    /Stream #\d+:\d+.*Video:.*?\s(\d{2,5})x(\d{2,5})(?:[\s,]|$)/i
+  );
+  if (outDimMatch) {
+    proxyW = parseInt(outDimMatch[1], 10) || rawSourceW;
+    proxyH = parseInt(outDimMatch[2], 10) || rawSourceH;
+  }
+
+  // If ffmpeg auto-rotated the input stream (e.g. 90/-90 deg portrait iPhone .MOV),
+  // align sourceWidth/sourceHeight orientation with the auto-rotated proxy output.
+  let sourceW = rawSourceW;
+  let sourceH = rawSourceH;
+  if (
+    proxyW !== proxyH &&
+    rawSourceW !== rawSourceH &&
+    rawSourceW > rawSourceH !== proxyW > proxyH
+  ) {
+    sourceW = rawSourceH;
+    sourceH = rawSourceW;
+  }
+
+  return {
+    duration,
+    hasAudio,
+    width: sourceW,
+    height: sourceH,
+    proxyWidth: proxyW,
+    proxyHeight: proxyH,
+  };
+}
+
+/**
+ * Caches the original uploaded video on disk for lossless/direct offline export,
+ * and generates a lightweight, 8-bit yuv420p H.264 stage proxy (max 960px, frequent keyframes)
+ * so the browser canvas preview never lags, stutters, or renders black frames.
+ */
+async function handleImportVideo(req, res, urlObj) {
+  try {
+    const inputBuffer = await collectRequestBody(req);
+    if (!inputBuffer.length) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Empty video buffer received' }));
+      return;
+    }
+
+    const origName = urlObj.searchParams.get('name') || 'video.mp4';
+    const rawExt = path.extname(origName).toLowerCase();
+    const safeExt =
+      rawExt && /^[.][a-z0-9]{2,5}$/.test(rawExt) ? rawExt : '.mp4';
+
+    const serverVideoId = `vid_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const sourcePath = path.join(
+      SESSION_MEDIA_DIR,
+      `${serverVideoId}_source${safeExt}`
+    );
+    const proxyPath = path.join(
+      SESSION_MEDIA_DIR,
+      `${serverVideoId}_proxy.mp4`
+    );
+
+    fs.writeFileSync(sourcePath, inputBuffer);
+
+    const ffArgs = [
+      '-y',
+      '-i',
+      sourcePath,
+      '-vf',
+      "scale='min(960,iw)':-2,format=yuv420p",
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-profile:v',
+      'main',
+      '-crf',
+      '22',
+      '-g',
+      '15',
+      '-c:a',
+      'aac',
+      '-b:a',
+      '128k',
+      '-movflags',
+      '+faststart',
+      proxyPath,
+    ];
+
+    const ffRes = await runCommandPromise(FFMPEG_BIN, ffArgs);
+    if (
+      !ffRes.ok ||
+      !fs.existsSync(proxyPath) ||
+      fs.statSync(proxyPath).size === 0
+    ) {
+      try {
+        if (fs.existsSync(sourcePath)) fs.unlinkSync(sourcePath);
+        if (fs.existsSync(proxyPath)) fs.unlinkSync(proxyPath);
+      } catch {}
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error:
+            'Failed to process video with ffmpeg. Ensure ffmpeg is installed (`brew install ffmpeg` on macOS or `sudo apt install ffmpeg` on Linux).',
+          details: ffRes.error,
+        })
+      );
+      return;
+    }
+
+    const meta = parseFfmpegVideoMetadata(ffRes.stderr || '');
+    const record = {
+      serverVideoId,
+      sourcePath,
+      proxyPath,
+      width: meta.width,
+      height: meta.height,
+      proxyWidth: meta.proxyWidth,
+      proxyHeight: meta.proxyHeight,
+      duration: meta.duration,
+      hasAudio: meta.hasAudio,
+    };
+    uploadedVideos.set(serverVideoId, record);
+
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+    });
+    res.end(
+      JSON.stringify({
+        serverVideoId,
+        proxyUrl: `/api/video-proxy/${serverVideoId}`,
+        width: meta.width,
+        height: meta.height,
+        proxyWidth: meta.proxyWidth,
+        proxyHeight: meta.proxyHeight,
+        duration: meta.duration,
+        hasAudio: meta.hasAudio,
+      })
+    );
+  } catch (err) {
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: String(err) }));
+  }
+}
+
+/**
+ * Serves the lightweight stage proxy MP4 with full HTTP Range (206 Partial Content) support
+ * so browser <video> elements can seek, scrub, and loop instantaneously.
+ */
+function handleServeVideoProxy(req, res, serverVideoId) {
+  const entry = uploadedVideos.get(serverVideoId);
+  const proxyPath =
+    entry?.proxyPath ||
+    path.join(SESSION_MEDIA_DIR, `${serverVideoId}_proxy.mp4`);
+
+  if (!fs.existsSync(proxyPath)) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: `Video proxy not found: ${serverVideoId}` }));
+    return;
+  }
+
+  const stat = fs.statSync(proxyPath);
+  const total = stat.size;
+  const rangeHeader = req.headers.range;
+
+  if (rangeHeader) {
+    const parts = rangeHeader.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10) || 0;
+    const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
+    const clampedStart = Math.max(0, Math.min(start, total - 1));
+    const clampedEnd = Math.max(clampedStart, Math.min(end, total - 1));
+    const chunkSize = clampedEnd - clampedStart + 1;
+
+    res.writeHead(206, {
+      'Content-Range': `bytes ${clampedStart}-${clampedEnd}/${total}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunkSize,
+      'Content-Type': 'video/mp4',
+      'Cache-Control': 'no-cache',
+    });
+    fs.createReadStream(proxyPath, {
+      start: clampedStart,
+      end: clampedEnd,
+    }).pipe(res);
+  } else {
+    res.writeHead(200, {
+      'Content-Length': total,
+      'Accept-Ranges': 'bytes',
+      'Content-Type': 'video/mp4',
+      'Cache-Control': 'no-cache',
+    });
+    fs.createReadStream(proxyPath).pipe(res);
+  }
+}
+
+/**
+ * Offline deterministic ffmpeg compositor for video slides (`POST /api/render-video-slide`).
+ * Composites the slide's static underlay PNG, each original source video layer (trimmed, looped/frozen,
+ * cropped, scaled, and rounded-corner masked), and optional foreground static overlay PNG directly
+ * into a 60fps 1440p H.264 + AAC .mp4 with zero real-time browser capture lag or dropped frames.
+ */
+async function handleRenderVideoSlide(req, res) {
+  const tempFiles = [];
+  const cleanupTempFiles = () => {
+    for (const f of tempFiles) {
+      try {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch {}
+    }
+  };
+
+  try {
+    const bodyBuf = await collectRequestBody(req);
+    const payload = JSON.parse(bodyBuf.toString('utf8'));
+
+    const slideWidth = Math.round(Number(payload.slideWidth) || 1440);
+    const slideHeight = Math.round(Number(payload.slideHeight) || 1800);
+    const totalDuration = Math.min(
+      60,
+      Math.max(0.5, Number(payload.totalDuration) || 5)
+    );
+    const underlayPngBase64 = payload.underlayPngBase64;
+    const overlayPngBase64 = payload.overlayPngBase64 || null;
+    const videoLayers = Array.isArray(payload.videoLayers)
+      ? payload.videoLayers
+      : [];
+
+    if (!underlayPngBase64 || videoLayers.length === 0) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          error: 'Missing underlayPngBase64 or videoLayers in render request',
+        })
+      );
+      return;
+    }
+
+    const jobId = `render_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const underlayPath = path.join(SESSION_MEDIA_DIR, `${jobId}_underlay.png`);
+    fs.writeFileSync(underlayPath, Buffer.from(underlayPngBase64, 'base64'));
+    tempFiles.push(underlayPath);
+
+    let overlayPath = null;
+    if (overlayPngBase64) {
+      overlayPath = path.join(SESSION_MEDIA_DIR, `${jobId}_overlay.png`);
+      fs.writeFileSync(overlayPath, Buffer.from(overlayPngBase64, 'base64'));
+      tempFiles.push(overlayPath);
+    }
+
+    const outPath = path.join(SESSION_MEDIA_DIR, `${jobId}_out.mp4`);
+    tempFiles.push(outPath);
+
+    // Prepare inputs and filter_complex graph
+    const inputArgs = [
+      '-loop',
+      '1',
+      '-t',
+      totalDuration.toFixed(4),
+      '-framerate',
+      '60',
+      '-i',
+      underlayPath,
+    ];
+    let nextInputIdx = 1;
+
+    const filterChains = [
+      `[0:v]scale=${slideWidth}:${slideHeight},format=rgba[bg0]`,
+    ];
+    let currentBgLabel = '[bg0]';
+    const audioCandidateLabels = [];
+
+    for (let i = 0; i < videoLayers.length; i++) {
+      const layer = videoLayers[i];
+      const entry = uploadedVideos.get(layer.serverVideoId);
+      if (!entry || !fs.existsSync(entry.sourcePath)) {
+        cleanupTempFiles();
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: `Cached source video not found for ${layer.serverVideoId}. Please re-import the video file.`,
+          })
+        );
+        return;
+      }
+
+      const vidInputIdx = nextInputIdx++;
+      inputArgs.push('-i', entry.sourcePath);
+
+      const dx = Math.round(Number(layer.dx) || 0);
+      const dy = Math.round(Number(layer.dy) || 0);
+      const dw = Math.max(2, Math.round(Number(layer.dw) || slideWidth));
+      const dh = Math.max(2, Math.round(Number(layer.dh) || slideHeight));
+
+      const cropX = Math.max(0, Math.min(0.99, Number(layer.crop?.x) || 0));
+      const cropY = Math.max(0, Math.min(0.99, Number(layer.crop?.y) || 0));
+      const cropW = Math.max(
+        0.01,
+        Math.min(1 - cropX, Number(layer.crop?.width) || 1)
+      );
+      const cropH = Math.max(
+        0.01,
+        Math.min(1 - cropY, Number(layer.crop?.height) || 1)
+      );
+
+      const trimStart = Math.max(0, Number(layer.trimStart) || 0);
+      const rawTrimEnd = Number(layer.trimEnd);
+      const trimEnd =
+        rawTrimEnd > trimStart + 0.05
+          ? rawTrimEnd
+          : Math.max(trimStart + 0.5, entry.duration || totalDuration);
+      const clipDur = Math.max(0.1, trimEnd - trimStart);
+      const endBehavior = layer.endBehavior === 'freeze' ? 'freeze' : 'loop';
+
+      let vChain = `[${vidInputIdx}:v]trim=start=${trimStart.toFixed(4)}:end=${trimEnd.toFixed(4)},setpts=PTS-STARTPTS,fps=60,crop=w='max(2,iw*${cropW.toFixed(6)})':h='max(2,ih*${cropH.toFixed(6)})':x='iw*${cropX.toFixed(6)}':y='ih*${cropY.toFixed(6)}',scale=${dw}:${dh}:flags=lanczos,format=rgba`;
+
+      if (clipDur < totalDuration - 0.05) {
+        if (endBehavior === 'freeze') {
+          const padDur = (totalDuration - clipDur + 0.5).toFixed(4);
+          vChain += `,tpad=stop_mode=clone:stop_duration=${padDur},trim=duration=${totalDuration.toFixed(4)},setpts=PTS-STARTPTS`;
+        } else {
+          const loopsNeeded = Math.ceil(totalDuration / clipDur);
+          const loopFrames = Math.ceil(clipDur * 60) + 2;
+          vChain += `,loop=loop=${loopsNeeded}:size=${loopFrames}:start=0,setpts=N/(60*TB),trim=duration=${totalDuration.toFixed(4)},setpts=PTS-STARTPTS`;
+        }
+      } else {
+        vChain += `,trim=duration=${totalDuration.toFixed(4)},setpts=PTS-STARTPTS`;
+      }
+
+      let layerOutLabel = `[vlayer${i}]`;
+      if (layer.maskPngBase64) {
+        const maskPath = path.join(SESSION_MEDIA_DIR, `${jobId}_mask_${i}.png`);
+        fs.writeFileSync(maskPath, Buffer.from(layer.maskPngBase64, 'base64'));
+        tempFiles.push(maskPath);
+
+        const maskInputIdx = nextInputIdx++;
+        inputArgs.push(
+          '-loop',
+          '1',
+          '-t',
+          totalDuration.toFixed(4),
+          '-framerate',
+          '60',
+          '-i',
+          maskPath
+        );
+
+        const rawLabel = `[vraw${i}]`;
+        const maskLabel = `[vmask${i}]`;
+        filterChains.push(`${vChain}${rawLabel}`);
+        filterChains.push(
+          `[${maskInputIdx}:v]scale=${dw}:${dh},format=gray${maskLabel}`
+        );
+        filterChains.push(
+          `${rawLabel}${maskLabel}alphamerge${layerOutLabel}`
+        );
+      } else {
+        filterChains.push(`${vChain}${layerOutLabel}`);
+      }
+
+      const nextBgLabel = `[bg${i + 1}]`;
+      filterChains.push(
+        `${currentBgLabel}${layerOutLabel}overlay=x=${dx}:y=${dy}:format=auto:shortest=1${nextBgLabel}`
+      );
+      currentBgLabel = nextBgLabel;
+
+      if (!layer.muted && entry.hasAudio) {
+        let aChain = `[${vidInputIdx}:a]atrim=start=${trimStart.toFixed(4)}:end=${trimEnd.toFixed(4)},asetpts=PTS-STARTPTS`;
+        if (clipDur < totalDuration - 0.05) {
+          if (endBehavior === 'freeze') {
+            aChain += `,apad=whole_dur=${totalDuration.toFixed(4)}`;
+          } else {
+            const loopsNeeded = Math.ceil(totalDuration / clipDur);
+            const loopSamples = Math.ceil(clipDur * 48000);
+            aChain += `,aloop=loop=${loopsNeeded}:size=${loopSamples},atrim=duration=${totalDuration.toFixed(4)},asetpts=PTS-STARTPTS`;
+          }
+        } else {
+          aChain += `,atrim=duration=${totalDuration.toFixed(4)},asetpts=PTS-STARTPTS`;
+        }
+        const aLabel = `[aud${i}]`;
+        filterChains.push(`${aChain}${aLabel}`);
+        audioCandidateLabels.push(aLabel);
+      }
+    }
+
+    if (overlayPath) {
+      const ovInputIdx = nextInputIdx++;
+      inputArgs.push(
+        '-loop',
+        '1',
+        '-t',
+        totalDuration.toFixed(4),
+        '-framerate',
+        '60',
+        '-i',
+        overlayPath
+      );
+      const nextBgLabel = `[bg_ov]`;
+      filterChains.push(
+        `${currentBgLabel}[${ovInputIdx}:v]overlay=x=0:y=0:format=auto:shortest=1${nextBgLabel}`
+      );
+      currentBgLabel = nextBgLabel;
+    }
+
+    const outEvenW = Math.floor(slideWidth / 2) * 2;
+    const outEvenH = Math.floor(slideHeight / 2) * 2;
+    filterChains.push(
+      `${currentBgLabel}scale=${outEvenW}:${outEvenH},format=yuv420p[vout]`
+    );
+
+    const buildFfmpegArgs = (includeAudio) => {
+      const chains = [...filterChains];
+      const mapArgs = ['-map', '[vout]'];
+      if (includeAudio && audioCandidateLabels.length === 1) {
+        mapArgs.push('-map', audioCandidateLabels[0]);
+      } else if (includeAudio && audioCandidateLabels.length > 1) {
+        chains.push(
+          `${audioCandidateLabels.join('')}amix=inputs=${audioCandidateLabels.length}:duration=first:dropout_transition=0[aout]`
+        );
+        mapArgs.push('-map', '[aout]');
+      }
+
+      return [
+        '-y',
+        ...inputArgs,
+        '-filter_complex',
+        chains.join(';'),
+        ...mapArgs,
+        '-c:v',
+        'libx264',
+        '-preset',
+        'fast',
+        '-profile:v',
+        'high',
+        '-level',
+        '4.2',
+        '-crf',
+        '17',
+        '-maxrate',
+        '15000k',
+        '-bufsize',
+        '30000k',
+        '-pix_fmt',
+        'yuv420p',
+        '-r',
+        '60',
+        ...(includeAudio && audioCandidateLabels.length > 0
+          ? ['-c:a', 'aac', '-b:a', '256k']
+          : ['-an']),
+        '-t',
+        totalDuration.toFixed(4),
+        '-movflags',
+        '+faststart',
+        outPath,
+      ];
+    };
+
+    let ffRes = await runCommandPromise(
+      FFMPEG_BIN,
+      buildFfmpegArgs(audioCandidateLabels.length > 0)
+    );
+
+    // If audio mixing failed on an unusual audio stream, retry video-only so export still succeeds
+    if (
+      (!ffRes.ok || !fs.existsSync(outPath) || fs.statSync(outPath).size === 0) &&
+      audioCandidateLabels.length > 0
+    ) {
+      const videoOnlyChains = filterChains.filter(
+        (c) => !c.includes('atrim=') && !c.includes('[aud')
+      );
+      const fallbackArgs = [
+        '-y',
+        ...inputArgs,
+        '-filter_complex',
+        videoOnlyChains.join(';'),
+        '-map',
+        '[vout]',
+        '-c:v',
+        'libx264',
+        '-preset',
+        'fast',
+        '-profile:v',
+        'high',
+        '-level',
+        '4.2',
+        '-crf',
+        '17',
+        '-maxrate',
+        '15000k',
+        '-bufsize',
+        '30000k',
+        '-pix_fmt',
+        'yuv420p',
+        '-r',
+        '60',
+        '-an',
+        '-t',
+        totalDuration.toFixed(4),
+        '-movflags',
+        '+faststart',
+        outPath,
+      ];
+      ffRes = await runCommandPromise(FFMPEG_BIN, fallbackArgs);
+    }
+
+    if (ffRes.ok && fs.existsSync(outPath) && fs.statSync(outPath).size > 0) {
+      const mp4Buffer = fs.readFileSync(outPath);
+      cleanupTempFiles();
+      res.writeHead(200, {
+        'Content-Type': 'video/mp4',
+        'Content-Length': mp4Buffer.length,
+        'Cache-Control': 'no-store',
+      });
+      res.end(mp4Buffer);
+      return;
+    }
+
+    cleanupTempFiles();
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error: 'Offline ffmpeg slide render failed',
+        details: ffRes.error,
+      })
+    );
+  } catch (err) {
+    cleanupTempFiles();
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: String(err) }));
+  }
+}
+
 function handleTranscodeMp4(req, res) {
   const chunks = [];
   req.on('data', (chunk) => chunks.push(chunk));
@@ -481,6 +1062,22 @@ const server = http.createServer((req, res) => {
     `http://${req.headers.host || 'localhost'}`
   );
   const pathname = decodeURIComponent(urlObj.pathname);
+
+  if (req.method === 'POST' && pathname === '/api/import-video') {
+    handleImportVideo(req, res, urlObj);
+    return;
+  }
+
+  if (req.method === 'GET' && pathname.startsWith('/api/video-proxy/')) {
+    const serverVideoId = pathname.slice('/api/video-proxy/'.length);
+    handleServeVideoProxy(req, res, serverVideoId);
+    return;
+  }
+
+  if (req.method === 'POST' && pathname === '/api/render-video-slide') {
+    handleRenderVideoSlide(req, res);
+    return;
+  }
 
   if (req.method === 'POST' && pathname === '/api/transcode-mp4') {
     handleTranscodeMp4(req, res);

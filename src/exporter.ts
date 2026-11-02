@@ -4,7 +4,11 @@ import {
   MediaAsset,
   Slide,
 } from './types';
-import { getVisibleLayersForSlide, renderSlideToCanvas } from './renderer';
+import {
+  drawRoundedRectPath,
+  getVisibleLayersForSlide,
+  renderSlideToCanvas,
+} from './renderer';
 
 declare global {
   interface Window {
@@ -176,8 +180,39 @@ export async function exportStaticSlide(
   };
 }
 
+function canvasToPngBase64(canvas: HTMLCanvasElement): string {
+  const dataUrl = canvas.toDataURL('image/png');
+  const commaIdx = dataUrl.indexOf(',');
+  return commaIdx >= 0 ? dataUrl.slice(commaIdx + 1) : dataUrl;
+}
+
+function createRoundedMaskPngBase64(
+  width: number,
+  height: number,
+  borderRadius: number
+): string {
+  const w = Math.max(2, Math.round(width));
+  const h = Math.max(2, Math.round(height));
+  const maskCanvas = document.createElement('canvas');
+  maskCanvas.width = w;
+  maskCanvas.height = h;
+  const mctx = maskCanvas.getContext('2d');
+  if (!mctx) throw new Error('Could not initialize rounded mask canvas');
+
+  // Black = transparent (0), White = opaque (255) for ffmpeg alphamerge
+  mctx.fillStyle = '#000000';
+  mctx.fillRect(0, 0, w, h);
+  mctx.fillStyle = '#ffffff';
+  drawRoundedRectPath(mctx, 0, 0, w, h, borderRadius);
+  mctx.fill();
+
+  return canvasToPngBase64(maskCanvas);
+}
+
 /**
  * Renders and encodes a slide containing one or more videos into an Instagram-ready .mp4.
+ * Uses deterministic offline server-side `ffmpeg` compositing (`POST /api/render-video-slide`)
+ * directly from cached original source video files so exported videos have zero frame drops or lag.
  */
 export async function exportVideoSlide(
   slides: Slide[],
@@ -198,7 +233,7 @@ export async function exportVideoSlide(
   );
 
   // Determine total composite slide duration (longest trimmed video clip, capped at 60s)
-  let totalDuration = 5;
+  let totalDuration = 0.5;
   for (const item of videoItems) {
     const asset = assetsById.get(item.layer.assetId);
     const clipEnd =
@@ -211,6 +246,152 @@ export async function exportVideoSlide(
     }
   }
   totalDuration = Math.min(60, Math.max(1, totalDuration));
+
+  // Primary path: deterministic offline ffmpeg compositing from original cached source files
+  const canUseOfflineFfmpeg =
+    videoItems.length > 0 &&
+    videoItems.every((item) =>
+      Boolean(assetsById.get(item.layer.assetId)?.serverVideoId)
+    );
+
+  if (canUseOfflineFfmpeg) {
+    onProgress(0.08);
+    const firstVideoZ = Math.min(...videoItems.map((v) => v.layer.zIndex));
+
+    // 1. Render static underlay PNG (background + all drop shadows + static photos below video layers)
+    const underlayCanvas = document.createElement('canvas');
+    underlayCanvas.width = slideWidth;
+    underlayCanvas.height = slideHeight;
+    const underlayCtx = underlayCanvas.getContext('2d');
+    if (!underlayCtx) {
+      throw new Error('Could not initialize underlay export canvas');
+    }
+    underlayCtx.imageSmoothingEnabled = true;
+    underlayCtx.imageSmoothingQuality = 'high';
+
+    renderSlideToCanvas(underlayCtx, {
+      slides,
+      slideIndex,
+      slideWidth,
+      slideHeight,
+      assetsById,
+      scale: 1,
+      isExport: true,
+      skipBackground: false,
+      layerFilter: (layer, asset) =>
+        asset.type !== 'video' && layer.zIndex <= firstVideoZ,
+      renderShadowForFilteredOutLayers: true,
+    });
+    const underlayPngBase64 = canvasToPngBase64(underlayCanvas);
+
+    // 2. Render optional foreground static overlay PNG (static photos stacked above video layers)
+    const hasForegroundPhotos = visible.some((item) => {
+      const a = assetsById.get(item.layer.assetId);
+      return a && a.type !== 'video' && item.layer.zIndex > firstVideoZ;
+    });
+
+    let overlayPngBase64: string | null = null;
+    if (hasForegroundPhotos) {
+      const overlayCanvas = document.createElement('canvas');
+      overlayCanvas.width = slideWidth;
+      overlayCanvas.height = slideHeight;
+      const overlayCtx = overlayCanvas.getContext('2d');
+      if (overlayCtx) {
+        overlayCtx.imageSmoothingEnabled = true;
+        overlayCtx.imageSmoothingQuality = 'high';
+        renderSlideToCanvas(overlayCtx, {
+          slides,
+          slideIndex,
+          slideWidth,
+          slideHeight,
+          assetsById,
+          scale: 1,
+          isExport: true,
+          skipBackground: true,
+          layerFilter: (layer, asset) =>
+            asset.type !== 'video' && layer.zIndex > firstVideoZ,
+          renderShadowForFilteredOutLayers: false,
+        });
+        overlayPngBase64 = canvasToPngBase64(overlayCanvas);
+      }
+    }
+
+    // 3. Build per-video-layer placement, crop, trim, and rounded-corner mask recipe
+    const videoLayersPayload = videoItems.map((item) => {
+      const asset = assetsById.get(item.layer.assetId)!;
+      const dx = Math.round(item.localX);
+      const dy = Math.round(item.layer.y);
+      const dw = Math.max(2, Math.round(item.layer.width));
+      const dh = Math.max(2, Math.round(item.layer.height));
+      const radius = Math.round(item.layer.borderRadius || 0);
+      const maskPngBase64 =
+        radius > 0 ? createRoundedMaskPngBase64(dw, dh, radius) : null;
+
+      const trimStart = Math.max(0, item.layer.trimStart || 0);
+      const trimEnd =
+        item.layer.trimEnd > trimStart
+          ? item.layer.trimEnd
+          : asset.duration || totalDuration;
+
+      return {
+        serverVideoId: asset.serverVideoId!,
+        dx,
+        dy,
+        dw,
+        dh,
+        crop: item.layer.crop,
+        trimStart,
+        trimEnd,
+        muted: Boolean(item.layer.muted),
+        endBehavior: item.layer.endBehavior || 'loop',
+        maskPngBase64,
+      };
+    });
+
+    onProgress(0.2);
+    let simulatedProgress = 0.2;
+    const progressTimer = window.setInterval(() => {
+      simulatedProgress = Math.min(0.92, simulatedProgress + 0.04);
+      onProgress(simulatedProgress);
+    }, 250);
+
+    try {
+      const resp = await fetch('/api/render-video-slide', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          slideWidth,
+          slideHeight,
+          totalDuration,
+          underlayPngBase64,
+          overlayPngBase64,
+          videoLayers: videoLayersPayload,
+        }),
+      });
+      window.clearInterval(progressTimer);
+
+      if (!resp.ok) {
+        const errJson = await resp.json().catch(() => ({}));
+        throw new Error(
+          errJson.details ||
+            errJson.error ||
+            `Offline ffmpeg video slide render failed (HTTP ${resp.status})`
+        );
+      }
+
+      const mp4Blob = await resp.blob();
+      onProgress(1);
+      return {
+        blob: mp4Blob,
+        width: slideWidth,
+        height: slideHeight,
+        ext: 'mp4',
+      };
+    } catch (err) {
+      window.clearInterval(progressTimer);
+      throw err;
+    }
+  }
 
   // Create isolated video clones so export playback doesn't conflict with editor stage
   const clonedAssetsMap = new Map<string, MediaAsset>(assetsById);

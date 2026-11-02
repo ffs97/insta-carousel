@@ -190,6 +190,7 @@ export function App() {
   const [importErrors, setImportErrors] = useState<string[]>([]);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const hiddenVideoPoolRef = useRef<HTMLDivElement | null>(null);
   const stageCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageViewportRef = useRef<HTMLDivElement | null>(null);
   const dragRef = useRef<DragInteraction | null>(null);
@@ -415,6 +416,15 @@ export function App() {
           vid.loop = true;
           vid.playsInline = true;
           vid.preload = 'auto';
+          vid.style.width = '1px';
+          vid.style.height = '1px';
+          vid.style.opacity = '0.01';
+          vid.style.pointerEvents = 'none';
+
+          // Keep <video> mounted in a live 1x1px DOM container so the browser
+          // hardware decoder/compositor never suspends or black-frames it.
+          const pool = hiddenVideoPoolRef.current || document.body;
+          pool.appendChild(vid);
 
           const cleanup = () => {
             vid.onloadeddata = null;
@@ -426,6 +436,7 @@ export function App() {
             if (vid.videoWidth > 0 && vid.videoHeight > 0) {
               resolve(vid);
             } else {
+              vid.remove();
               reject(
                 new Error(
                   'Video stream codec unsupported by browser (videoWidth is 0)'
@@ -435,6 +446,7 @@ export function App() {
           };
           vid.onerror = () => {
             cleanup();
+            vid.remove();
             const mediaErr = vid.error
               ? `code ${vid.error.code}${
                   vid.error.message ? `: ${vid.error.message}` : ''
@@ -545,72 +557,87 @@ export function App() {
             newErrors.push(msg);
           }
         } else if (isVideo) {
-          let activeUrl = URL.createObjectURL(file);
           try {
-            setImportStatus(`Loading video ${file.name}…`);
-            let vid: HTMLVideoElement;
-            try {
-              vid = await loadVideoElement(activeUrl);
-            } catch (nativeErr) {
-              // Native browser decode failed (common for iPhone HEVC / QuickTime .MOV files).
-              // Normalize to H.264 + AAC .mp4 via local dev-server ffmpeg endpoint.
-              URL.revokeObjectURL(activeUrl);
-              activeUrl = '';
-              setImportStatus(
-                `Normalizing ${file.name} to H.264 MP4 via ffmpeg…`
-              );
-              const resp = await fetch('/api/normalize-video', {
+            setImportStatus(
+              `Preparing lightweight stage proxy for ${file.name}…`
+            );
+            const resp = await fetch(
+              `/api/import-video?name=${encodeURIComponent(file.name)}`,
+              {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/octet-stream' },
                 body: await file.arrayBuffer(),
-              });
-              if (!resp.ok) {
-                const errJson = await resp.json().catch(() => ({}));
-                throw new Error(
-                  errJson.error
-                    ? `${errJson.error}${
-                        errJson.details ? ` (${errJson.details})` : ''
-                      }`
-                    : `Native decode failed (${
-                        nativeErr instanceof Error
-                          ? nativeErr.message
-                          : String(nativeErr)
-                      }) and server /api/normalize-video returned HTTP ${
-                        resp.status
-                      }`
-                );
               }
-              const mp4Blob = await resp.blob();
-              activeUrl = URL.createObjectURL(mp4Blob);
-              vid = await loadVideoElement(activeUrl);
+            );
+
+            if (!resp.ok) {
+              const errJson = await resp.json().catch(() => ({}));
+              throw new Error(
+                errJson.error
+                  ? `${errJson.error}${
+                      errJson.details ? ` (${errJson.details})` : ''
+                    }`
+                  : `Server /api/import-video returned HTTP ${resp.status}`
+              );
             }
 
-            // Seek slightly in to capture a representative thumbnail & saliency frame
+            const meta = (await resp.json()) as {
+              serverVideoId: string;
+              proxyUrl: string;
+              width: number;
+              height: number;
+              proxyWidth: number;
+              proxyHeight: number;
+              duration: number;
+              hasAudio: boolean;
+            };
+
+            const vid = await loadVideoElement(meta.proxyUrl);
+
+            // Seek slightly in and wait for a decoded frame (readyState >= 2)
+            // so the thumbnail & saliency analysis never capture a black frame
             const dur =
               Number.isFinite(vid.duration) && vid.duration > 0
                 ? vid.duration
-                : 5;
+                : meta.duration || 5;
             vid.currentTime = Math.min(0.5, dur * 0.15);
             await new Promise<void>((resolve) => {
-              const onSeeked = () => resolve();
+              let settled = false;
+              const finish = () => {
+                if (!settled) {
+                  settled = true;
+                  resolve();
+                }
+              };
+              const onSeeked = () => {
+                if (vid.readyState >= 2) finish();
+                else
+                  vid.addEventListener('loadeddata', finish, { once: true });
+              };
               vid.addEventListener('seeked', onSeeked, { once: true });
-              setTimeout(resolve, 250);
+              setTimeout(finish, 600);
             });
 
-            const w = vid.videoWidth || 1440;
-            const h = vid.videoHeight || 1800;
-            const analysis = analyzeMediaElement(vid, w, h);
+            const proxyW = vid.videoWidth || meta.proxyWidth || 960;
+            const proxyH = vid.videoHeight || meta.proxyHeight || 1200;
+            const analysis = analyzeMediaElement(vid, proxyW, proxyH);
+
+            const sourceW = meta.width || proxyW;
+            const sourceH = meta.height || proxyH;
+
+            vid.currentTime = 0;
             vid.play().catch(() => {});
 
             imported.push({
               id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
               name: file.name,
               type: 'video',
-              url: activeUrl,
+              url: meta.proxyUrl,
+              serverVideoId: meta.serverVideoId,
               thumbnailUrl: analysis.thumbnailUrl,
-              naturalWidth: w,
-              naturalHeight: h,
-              aspectRatio: w / h,
+              naturalWidth: sourceW,
+              naturalHeight: sourceH,
+              aspectRatio: sourceW / sourceH,
               duration: dur,
               dominantColors: analysis.dominantColors,
               smartFocalPoint: analysis.smartFocalPoint,
@@ -619,7 +646,6 @@ export function App() {
               element: vid,
             });
           } catch (err) {
-            if (activeUrl) URL.revokeObjectURL(activeUrl);
             const reason = err instanceof Error ? err.message : String(err);
             const msg = `Failed to import video "${file.name}": ${reason}`;
             console.error('[Import Error]', msg);
@@ -686,6 +712,7 @@ export function App() {
         target.element.pause();
         target.element.removeAttribute('src');
         target.element.load();
+        target.element.remove();
       }
       if (target.url.startsWith('blob:')) {
         URL.revokeObjectURL(target.url);
@@ -1127,10 +1154,78 @@ export function App() {
     []
   );
 
-  // Live Stage Rendering Loop (supports smooth 30-60fps video playback on stage!)
+  // Live Stage Rendering Loop (supports smooth 60fps proxy video playback on stage
+  // while avoiding unnecessary CPU/GPU ticks when viewing static-only slides)
   useEffect(() => {
     let animId = 0;
-    const renderLoop = () => {
+
+    // Determine which video assets are visible on the current stage view
+    const visibleSlideIndices =
+      viewMode === 'strip'
+        ? slides.map((_, idx) => idx)
+        : [Math.min(activeSlideIndex, Math.max(0, slides.length - 1))];
+
+    const visibleVideoLayers: { layer: SlideLayer; asset: MediaAsset }[] = [];
+    const visibleVideoAssetIds = new Set<string>();
+
+    for (const sIdx of visibleSlideIndices) {
+      const s = slides[sIdx];
+      if (!s) continue;
+      if (s.background.type === 'blur') {
+        const bgId = s.background.blurAssetId || s.layers[0]?.assetId;
+        const bgAsset = bgId ? assetsById.get(bgId) : undefined;
+        if (bgAsset?.type === 'video') {
+          visibleVideoAssetIds.add(bgAsset.id);
+        }
+      }
+      const visItems = getVisibleLayersForSlide(slides, sIdx, slideWidth);
+      for (const item of visItems) {
+        const asset = assetsById.get(item.layer.assetId);
+        if (asset?.type === 'video') {
+          visibleVideoAssetIds.add(asset.id);
+          visibleVideoLayers.push({ layer: item.layer, asset });
+        }
+      }
+    }
+
+    // Pause off-screen video elements to free hardware decoder resources; play visible ones
+    for (const asset of assetsById.values()) {
+      if (asset.type === 'video' && asset.element instanceof HTMLVideoElement) {
+        if (visibleVideoAssetIds.has(asset.id)) {
+          if (asset.element.paused) {
+            asset.element.play().catch(() => {});
+          }
+        } else if (!asset.element.paused) {
+          asset.element.pause();
+        }
+      }
+    }
+
+    const hasVisibleVideo = visibleVideoAssetIds.size > 0;
+
+    const renderFrame = () => {
+      // Enforce [trimStart, trimEnd] bounds for visible video layers on stage
+      for (const { layer, asset } of visibleVideoLayers) {
+        if (asset.element instanceof HTMLVideoElement) {
+          const vid = asset.element;
+          const tStart = Math.max(0, layer.trimStart || 0);
+          const tEnd =
+            layer.trimEnd > tStart + 0.05
+              ? layer.trimEnd
+              : asset.duration || vid.duration || 5;
+          if (vid.currentTime < tStart - 0.05) {
+            vid.currentTime = tStart;
+          } else if (vid.currentTime >= tEnd) {
+            if (layer.endBehavior === 'freeze') {
+              vid.pause();
+            } else {
+              vid.currentTime = tStart;
+              if (vid.paused) vid.play().catch(() => {});
+            }
+          }
+        }
+      }
+
       const canvas = stageCanvasRef.current;
       if (canvas && slides.length > 0) {
         const ctx = canvas.getContext('2d');
@@ -1210,10 +1305,16 @@ export function App() {
           }
         }
       }
-      animId = requestAnimationFrame(renderLoop);
+
+      if (hasVisibleVideo) {
+        animId = requestAnimationFrame(renderFrame);
+      }
     };
-    animId = requestAnimationFrame(renderLoop);
-    return () => cancelAnimationFrame(animId);
+
+    renderFrame();
+    return () => {
+      if (animId) cancelAnimationFrame(animId);
+    };
   }, [
     slides,
     activeSlideIndex,
@@ -4167,6 +4268,24 @@ export function App() {
           </div>
         </div>
       )}
+
+      {/* Hidden 1x1px live DOM container so <video> elements keep active hardware decode surfaces */}
+      <div
+        id="hidden-video-pool"
+        ref={hiddenVideoPoolRef}
+        aria-hidden="true"
+        style={{
+          position: 'fixed',
+          bottom: 0,
+          right: 0,
+          width: 1,
+          height: 1,
+          opacity: 0.01,
+          pointerEvents: 'none',
+          overflow: 'hidden',
+          zIndex: -1,
+        }}
+      />
     </div>
   );
 }

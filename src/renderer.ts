@@ -62,7 +62,7 @@ function addRoundedRectSubpath(
   ctx.closePath();
 }
 
-function drawRoundedRectPath(
+export function drawRoundedRectPath(
   ctx: CanvasRenderingContext2D,
   x: number,
   y: number,
@@ -89,7 +89,7 @@ export interface RenderSlideOptions {
   slideWidth: number;
   slideHeight: number;
   assetsById: Map<string, MediaAsset>;
-  /** Scale factor from slide space (1080w) to target canvas pixels */
+  /** Scale factor from slide space (1440w) to target canvas pixels */
   scale: number;
   /** Destination X offset on target canvas (used in Strip View) */
   offsetX?: number;
@@ -102,6 +102,12 @@ export interface RenderSlideOptions {
   showProfileGridGuide?: boolean;
   showSmartFocalPoints?: boolean;
   isExport?: boolean;
+  /** When true, skips drawing the slide background (for transparent overlay passes) */
+  skipBackground?: boolean;
+  /** Optional predicate to filter which layers draw their media content */
+  layerFilter?: (layer: SlideLayer, asset: MediaAsset) => boolean;
+  /** When true, still renders outer drop shadows for layers excluded by layerFilter */
+  renderShadowForFilteredOutLayers?: boolean;
 }
 
 /**
@@ -127,6 +133,9 @@ export function renderSlideToCanvas(
     showProfileGridGuide = false,
     showSmartFocalPoints = false,
     isExport = false,
+    skipBackground = false,
+    layerFilter,
+    renderShadowForFilteredOutLayers = false,
   } = opts;
 
   const slide = slides[slideIndex];
@@ -142,32 +151,34 @@ export function renderSlideToCanvas(
   ctx.clip();
 
   // 1. Render Slide Background (P-3)
-  ctx.fillStyle = slide.background.color || '#0c0c0e';
-  ctx.fillRect(offsetX, offsetY, dstW, dstH);
+  if (!skipBackground) {
+    ctx.fillStyle = slide.background.color || '#0c0c0e';
+    ctx.fillRect(offsetX, offsetY, dstW, dstH);
 
-  if (slide.background.type === 'blur') {
-    const primaryAssetId =
-      slide.background.blurAssetId || slide.layers[0]?.assetId;
-    const bgAsset = primaryAssetId ? assetsById.get(primaryAssetId) : undefined;
-    if (bgAsset?.element) {
-      ctx.save();
-      const blurPx = Math.max(8, (slide.background.blurIntensity || 36) * scale);
-      ctx.filter = `blur(${blurPx}px) brightness(0.72) saturate(1.25)`;
-      // Cover-fit background element with 15% overscan to avoid blur edge bleed
-      const overscan = 1.18;
-      const mediaRatio = bgAsset.aspectRatio || 1;
-      const slideRatio = slideWidth / slideHeight;
-      let bw = dstW * overscan;
-      let bh = dstH * overscan;
-      if (mediaRatio > slideRatio) {
-        bw = bh * mediaRatio;
-      } else {
-        bh = bw / mediaRatio;
+    if (slide.background.type === 'blur') {
+      const primaryAssetId =
+        slide.background.blurAssetId || slide.layers[0]?.assetId;
+      const bgAsset = primaryAssetId ? assetsById.get(primaryAssetId) : undefined;
+      if (bgAsset?.element) {
+        ctx.save();
+        const blurPx = Math.max(8, (slide.background.blurIntensity || 36) * scale);
+        ctx.filter = `blur(${blurPx}px) brightness(0.72) saturate(1.25)`;
+        // Cover-fit background element with 15% overscan to avoid blur edge bleed
+        const overscan = 1.18;
+        const mediaRatio = bgAsset.aspectRatio || 1;
+        const slideRatio = slideWidth / slideHeight;
+        let bw = dstW * overscan;
+        let bh = dstH * overscan;
+        if (mediaRatio > slideRatio) {
+          bw = bh * mediaRatio;
+        } else {
+          bh = bw / mediaRatio;
+        }
+        const bx = offsetX + (dstW - bw) / 2;
+        const by = offsetY + (dstH - bh) / 2;
+        ctx.drawImage(bgAsset.element, bx, by, bw, bh);
+        ctx.restore();
       }
-      const bx = offsetX + (dstW - bw) / 2;
-      const by = offsetY + (dstH - bh) / 2;
-      ctx.drawImage(bgAsset.element, bx, by, bw, bh);
-      ctx.restore();
     }
   }
 
@@ -203,21 +214,35 @@ export function renderSlideToCanvas(
     const asset = assetsById.get(layer.assetId);
     if (!asset || !asset.element) continue;
 
+    const shouldDrawMedia = layerFilter ? layerFilter(layer, asset) : true;
+    const shouldDrawShadow =
+      shouldDrawMedia || Boolean(renderShadowForFilteredOutLayers);
+    if (!shouldDrawMedia && !shouldDrawShadow) continue;
+
     const dx = offsetX + localX * scale;
     const dy = offsetY + layer.y * scale;
     const dw = layer.width * scale;
     const dh = layer.height * scale;
     const radius = (layer.borderRadius || 0) * scale;
 
-    const sx = layer.crop.x * asset.naturalWidth;
-    const sy = layer.crop.y * asset.naturalHeight;
-    const sw = Math.max(1, layer.crop.width * asset.naturalWidth);
-    const sh = Math.max(1, layer.crop.height * asset.naturalHeight);
+    const elemW =
+      asset.element instanceof HTMLVideoElement
+        ? asset.element.videoWidth || asset.naturalWidth
+        : asset.naturalWidth;
+    const elemH =
+      asset.element instanceof HTMLVideoElement
+        ? asset.element.videoHeight || asset.naturalHeight
+        : asset.naturalHeight;
+
+    const sx = layer.crop.x * elemW;
+    const sy = layer.crop.y * elemH;
+    const sw = Math.max(1, layer.crop.width * elemW);
+    const sh = Math.max(1, layer.crop.height * elemH);
 
     const isCropActive = !isExport && cropModeLayerId === layer.id;
 
     // If this layer is in interactive Crop Mode, draw the dimmed full source media ghost outside the frame
-    if (isCropActive) {
+    if (shouldDrawMedia && isCropActive) {
       ctx.save();
       ctx.globalAlpha = 0.28;
       const fullW = dw / Math.max(0.05, layer.crop.width);
@@ -229,7 +254,7 @@ export function renderSlideToCanvas(
     }
 
     // Configurable outside drop shadow (clipped to exterior of rounded rect so fill never fringes image edges)
-    if (layer.shadow) {
+    if (shouldDrawShadow && layer.shadow) {
       const sBlur = Math.max(0, (layer.shadowBlur ?? 24) * scale);
       const sOffX = (layer.shadowOffsetX ?? 0) * scale;
       const sOffY = (layer.shadowOffsetY ?? 12) * scale;
@@ -254,6 +279,8 @@ export function renderSlideToCanvas(
         ctx.restore();
       }
     }
+
+    if (!shouldDrawMedia) continue;
 
     // Draw clipped cropped media
     ctx.save();

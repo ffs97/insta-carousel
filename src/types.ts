@@ -115,6 +115,8 @@ export interface MediaAsset {
   saliencyIntegral?: Float32Array;
   saliencyGridSize?: number;
   element?: HTMLImageElement | HTMLVideoElement;
+  /** Server-side cached video ID for offline frame-accurate ffmpeg export */
+  serverVideoId?: string;
 }
 
 export interface SlideLayer {
