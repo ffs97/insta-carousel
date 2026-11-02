@@ -1,0 +1,23 @@
+{
+  "name": "carouselflow-studio",
+  "version": "1.0.0",
+  "private": false,
+  "license": "MIT",
+  "description": "Web-based Instagram Carousel Photo & Video Editor with smart content-aware auto-cropping, multi-slide panorama splitting, magnetic snapping, and highest-resolution 1440px export.",
+  "type": "module",
+  "scripts": {
+    "dev": "node dev-server.mjs",
+    "start": "node dev-server.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "typescript": "^5.6.3"
+  }
+}
