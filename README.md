@@ -44,8 +44,8 @@
 Clone the repository and install the standard npm dependencies (`react`, `react-dom`, `jszip`, `typescript`):
 
 ```bash
-git clone <your-repo-url>
-cd insta-editor
+git clone https://github.com/ffs97/insta-carousel.git
+cd insta-carousel
 npm install
 ```
 

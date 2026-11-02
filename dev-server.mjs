@@ -46,14 +46,20 @@ const REACT_DOM_UMD_PATH = resolvePackageFile('react-dom', [
   'umd/react-dom.production.min.js',
   'umd/react-dom.development.js',
 ]);
+const JSZIP_PATH = resolvePackageFile('jszip', [
+  'dist/jszip.min.js',
+  'dist/jszip.js',
+]);
 const REACT_UMD_BUF = REACT_UMD_PATH ? fs.readFileSync(REACT_UMD_PATH) : null;
 const REACT_DOM_UMD_BUF = REACT_DOM_UMD_PATH
   ? fs.readFileSync(REACT_DOM_UMD_PATH)
   : null;
+const JSZIP_BUF = JSZIP_PATH ? fs.readFileSync(JSZIP_PATH) : null;
 
 const PUBLIC_CDN_URLS = {
   react: 'https://unpkg.com/react@18.3.1/umd/react.production.min.js',
   reactDom: 'https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js',
+  jszip: 'https://unpkg.com/jszip@3.10.1/dist/jszip.min.js',
 };
 
 const PORT = Number(process.env.PORT || 5173);
@@ -256,6 +262,17 @@ const server = http.createServer((req, res) => {
       res.end(REACT_DOM_UMD_BUF);
     } else {
       res.writeHead(302, { Location: PUBLIC_CDN_URLS.reactDom });
+      res.end();
+    }
+    return;
+  }
+
+  if (pathname === '/vendor/jszip.min.js') {
+    if (JSZIP_BUF) {
+      res.writeHead(200, { 'Content-Type': MIME_TYPES['.js'] });
+      res.end(JSZIP_BUF);
+    } else {
+      res.writeHead(302, { Location: PUBLIC_CDN_URLS.jszip });
       res.end();
     }
     return;

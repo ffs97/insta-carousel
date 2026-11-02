@@ -425,126 +425,30 @@ export function triggerBlobDownload(blob: Blob, filename: string): void {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
-const CRC32_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let i = 0; i < 256; i++) {
-    let c = i;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    table[i] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(bytes: Uint8Array): number {
-  let crc = 0xffffffff;
-  for (let i = 0; i < bytes.length; i++) {
-    crc = CRC32_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
 /**
- * Builds a standard uncompressed (STORE) PKZIP archive Blob directly in memory.
- */
-async function buildZipArchiveBlob(
-  entries: { filename: string; blob: Blob }[]
-): Promise<Blob> {
-  const encoder = new TextEncoder();
-  const fileRecords: {
-    nameBytes: Uint8Array;
-    dataBytes: Uint8Array;
-    crc: number;
-    offset: number;
-  }[] = [];
-
-  let offset = 0;
-  const localParts: Uint8Array[] = [];
-
-  for (const entry of entries) {
-    const nameBytes = encoder.encode(entry.filename);
-    const dataBytes = new Uint8Array(await entry.blob.arrayBuffer());
-    const crc = crc32(dataBytes);
-
-    const localHeader = new Uint8Array(30 + nameBytes.length);
-    const view = new DataView(localHeader.buffer);
-    view.setUint32(0, 0x04034b50, true); // Local file header signature
-    view.setUint16(4, 20, true); // Version needed to extract (2.0)
-    view.setUint16(6, 0x0800, true); // UTF-8 filename flag
-    view.setUint16(8, 0, true); // Compression method: 0 (STORE)
-    view.setUint16(10, 0, true); // Mod time
-    view.setUint16(12, 0, true); // Mod date
-    view.setUint32(14, crc, true); // CRC-32
-    view.setUint32(18, dataBytes.length, true); // Compressed size
-    view.setUint32(22, dataBytes.length, true); // Uncompressed size
-    view.setUint16(26, nameBytes.length, true); // Filename length
-    view.setUint16(28, 0, true); // Extra field length
-    localHeader.set(nameBytes, 30);
-
-    fileRecords.push({ nameBytes, dataBytes, crc, offset });
-    localParts.push(localHeader, dataBytes);
-    offset += localHeader.length + dataBytes.length;
-  }
-
-  const centralParts: Uint8Array[] = [];
-  let centralSize = 0;
-
-  for (const rec of fileRecords) {
-    const centralHeader = new Uint8Array(46 + rec.nameBytes.length);
-    const view = new DataView(centralHeader.buffer);
-    view.setUint32(0, 0x02014b50, true); // Central directory file header signature
-    view.setUint16(4, 20, true); // Version made by
-    view.setUint16(6, 20, true); // Version needed to extract
-    view.setUint16(8, 0x0800, true); // UTF-8 flag
-    view.setUint16(10, 0, true); // Compression method: 0 (STORE)
-    view.setUint16(12, 0, true);
-    view.setUint16(14, 0, true);
-    view.setUint32(16, rec.crc, true);
-    view.setUint32(20, rec.dataBytes.length, true);
-    view.setUint32(24, rec.dataBytes.length, true);
-    view.setUint16(28, rec.nameBytes.length, true);
-    view.setUint16(30, 0, true); // Extra field length
-    view.setUint16(32, 0, true); // File comment length
-    view.setUint16(34, 0, true); // Disk number start
-    view.setUint16(36, 0, true); // Internal file attributes
-    view.setUint32(38, 0, true); // External file attributes
-    view.setUint32(42, rec.offset, true); // Relative offset of local header
-    centralHeader.set(rec.nameBytes, 46);
-
-    centralParts.push(centralHeader);
-    centralSize += centralHeader.length;
-  }
-
-  const eocd = new Uint8Array(22);
-  const eocdView = new DataView(eocd.buffer);
-  eocdView.setUint32(0, 0x06054b50, true); // End of central directory signature
-  eocdView.setUint16(4, 0, true); // Number of this disk
-  eocdView.setUint16(6, 0, true); // Disk where central directory starts
-  eocdView.setUint16(8, fileRecords.length, true); // Number of central directory records on this disk
-  eocdView.setUint16(10, fileRecords.length, true); // Total number of central directory records
-  eocdView.setUint32(12, centralSize, true); // Size of central directory
-  eocdView.setUint32(16, offset, true); // Offset of start of central directory
-  eocdView.setUint16(20, 0, true); // Comment length
-
-  return new Blob([...localParts, ...centralParts, eocd], {
-    type: 'application/zip',
-  });
-}
-
-/**
- * Bundles multiple exported slide blobs into a single numbered .zip file.
+ * Bundles multiple exported slide blobs into a single numbered .zip file using JSZip.
  */
 export async function bundleExportsIntoZip(
   items: ExportSlideProgress[],
   zipFilename = 'instagram-carousel.zip'
 ): Promise<void> {
-  const validEntries = items.filter(
-    (item): item is ExportSlideProgress & { blob: Blob; filename: string } =>
-      Boolean(item.blob && item.filename)
-  );
-  if (validEntries.length === 0) return;
+  if (!window.JSZip) {
+    // Fallback: download individually if JSZip not loaded
+    for (const item of items) {
+      if (item.blob && item.filename) {
+        triggerBlobDownload(item.blob, item.filename);
+      }
+    }
+    return;
+  }
 
-  const zipBlob = await buildZipArchiveBlob(validEntries);
+  const zip = new window.JSZip();
+  for (const item of items) {
+    if (item.blob && item.filename) {
+      zip.file(item.filename, item.blob);
+    }
+  }
+
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
   triggerBlobDownload(zipBlob, zipFilename);
 }
