@@ -35,17 +35,21 @@
 
 ### 1. Prerequisites
 - **Node.js**: `v18.0.0` or newer (includes `npm`)
-- **FFmpeg** *(optional, recommended for video slides)*: Used by the local dev server to transcode composite video slides into strict Instagram-compliant `H.264` (`yuv420p`) + `AAC` `.mp4` files.
+- **FFmpeg** *(required for `.MOV` / HEVC video import & `.MP4` video slide export)*:
+  - Normalizes iPhone/camera `.MOV` (`HEVC` / 10-bit HDR / QuickTime) videos into browser-playable `H.264` `.mp4` on import, and encodes composite video slides on export.
   - **macOS (Homebrew)**: `brew install ffmpeg`
   - **Ubuntu / Debian**: `sudo apt install ffmpeg`
   - **Windows (Winget)**: `winget install Gyan.FFmpeg`
+- **`.HEIC` / `.HEIF` Photo Support**:
+  - **macOS**: Uses macOS's built-in `/usr/bin/sips` tool out of the box (no extra install needed), with automatic fallback to `ffmpeg` or the bundled `heic2any` npm package.
+  - **Linux**: Install `libheif-examples` (`sudo apt install libheif-examples`) or `ffmpeg`, or rely on the bundled `heic2any` npm package.
 
 ### 2. Install Dependencies
-Clone the repository and install the standard npm dependencies (`react`, `react-dom`, `jszip`, `typescript`):
+Clone the repository and install the standard npm dependencies (`react`, `react-dom`, `jszip`, `heic2any`, `typescript`):
 
 ```bash
 git clone https://github.com/ffs97/insta-carousel.git
-cd insta-carousel
+cd insta-editor
 npm install
 ```
 

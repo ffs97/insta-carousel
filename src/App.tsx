@@ -186,6 +186,8 @@ export function App() {
   >([]);
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const [isDraggingFileOver, setIsDraggingFileOver] = useState<boolean>(false);
+  const [importStatus, setImportStatus] = useState<string | null>(null);
+  const [importErrors, setImportErrors] = useState<string[]>([]);
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const stageCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -329,34 +331,201 @@ export function App() {
     pushHistory,
   ]);
 
-  // Import Local Files (Photos & Videos) — FR-1
+  // Import Local Files (Photos & Videos, including .HEIC/.HEIF & .MOV) — FR-1
   const handleFilesSelected = useCallback(
     async (fileList: FileList | null) => {
       if (!fileList || fileList.length === 0) return;
       const imported: MediaAsset[] = [];
+      const newErrors: string[] = [];
+
+      const loadImgFromUrl = (srcUrl: string): Promise<HTMLImageElement> =>
+        new Promise((resolve, reject) => {
+          const el = new Image();
+          el.onload = () => {
+            if (el.naturalWidth > 0 && el.naturalHeight > 0) {
+              resolve(el);
+            } else {
+              reject(new Error('Decoded image has 0×0 dimensions'));
+            }
+          };
+          el.onerror = () =>
+            reject(new Error('Browser failed to decode image data'));
+          el.src = srcUrl;
+        });
+
+      const convertHeicBlobToJpeg = async (file: File): Promise<Blob> => {
+        const errors: string[] = [];
+
+        // 1. Try local server /api/convert-heic (uses macOS `sips`, `heif-convert`, or `ffmpeg`)
+        try {
+          const resp = await fetch('/api/convert-heic', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: await file.arrayBuffer(),
+          });
+          if (resp.ok) {
+            const blob = await resp.blob();
+            if (blob.size > 0) return blob;
+          } else {
+            const errJson = await resp.json().catch(() => ({}));
+            errors.push(
+              errJson.details || errJson.error || `Server HTTP ${resp.status}`
+            );
+          }
+        } catch (err) {
+          errors.push(`Server /api/convert-heic error: ${String(err)}`);
+        }
+
+        // 2. Fallback to client-side `heic2any` library if loaded
+        const heic2anyFn = (window as unknown as { heic2any?: any }).heic2any;
+        if (typeof heic2anyFn === 'function') {
+          try {
+            const result = await heic2anyFn({
+              blob: file,
+              toType: 'image/jpeg',
+              quality: 0.96,
+            });
+            const outBlob = Array.isArray(result) ? result[0] : result;
+            if (outBlob instanceof Blob && outBlob.size > 0) {
+              return outBlob;
+            }
+          } catch (err) {
+            errors.push(
+              `heic2any error: ${
+                err instanceof Error
+                  ? err.message
+                  : JSON.stringify(err) || String(err)
+              }`
+            );
+          }
+        } else {
+          errors.push('heic2any library not available in browser');
+        }
+
+        throw new Error(errors.join(' | '));
+      };
+
+      const loadVideoElement = (
+        srcUrl: string
+      ): Promise<HTMLVideoElement> =>
+        new Promise((resolve, reject) => {
+          const vid = document.createElement('video');
+          vid.src = srcUrl;
+          vid.muted = true;
+          vid.loop = true;
+          vid.playsInline = true;
+          vid.preload = 'auto';
+
+          const cleanup = () => {
+            vid.onloadeddata = null;
+            vid.onerror = null;
+          };
+
+          vid.onloadeddata = () => {
+            cleanup();
+            if (vid.videoWidth > 0 && vid.videoHeight > 0) {
+              resolve(vid);
+            } else {
+              reject(
+                new Error(
+                  'Video stream codec unsupported by browser (videoWidth is 0)'
+                )
+              );
+            }
+          };
+          vid.onerror = () => {
+            cleanup();
+            const mediaErr = vid.error
+              ? `code ${vid.error.code}${
+                  vid.error.message ? `: ${vid.error.message}` : ''
+                }`
+              : 'unknown media error';
+            reject(new Error(`Browser video decode failed (${mediaErr})`));
+          };
+          vid.load();
+        });
 
       for (const file of Array.from(fileList)) {
-        const isVideo = file.type.startsWith('video/');
-        const isImage = file.type.startsWith('image/');
-        if (!isVideo && !isImage) continue;
+        const lowerName = file.name.toLowerCase();
+        const ext = lowerName.includes('.')
+          ? lowerName.slice(lowerName.lastIndexOf('.'))
+          : '';
 
-        const url = URL.createObjectURL(file);
+        const isHeic =
+          ext === '.heic' ||
+          ext === '.heif' ||
+          file.type === 'image/heic' ||
+          file.type === 'image/heif';
+
+        const isImage =
+          isHeic ||
+          file.type.startsWith('image/') ||
+          [
+            '.jpg',
+            '.jpeg',
+            '.png',
+            '.webp',
+            '.gif',
+            '.avif',
+            '.bmp',
+            '.svg',
+          ].includes(ext);
+
+        const isVideo =
+          !isImage &&
+          (file.type.startsWith('video/') ||
+            [
+              '.mp4',
+              '.mov',
+              '.m4v',
+              '.webm',
+              '.mkv',
+              '.avi',
+              '.ogv',
+              '.3gp',
+            ].includes(ext));
+
+        if (!isImage && !isVideo) {
+          const msg = `Unsupported file "${file.name}" (type: ${
+            file.type || 'unknown'
+          }). Supported formats: JPG, PNG, WebP, HEIC/HEIF, MP4, MOV, WebM.`;
+          console.error('[Import Error]', msg);
+          newErrors.push(msg);
+          continue;
+        }
+
         if (isImage) {
+          let activeUrl = '';
           try {
-            const img = await new Promise<HTMLImageElement>((resolve, reject) => {
-              const el = new Image();
-              el.onload = () => resolve(el);
-              el.onerror = (err) => reject(err);
-              el.src = url;
-            });
-            const w = img.naturalWidth || 1080;
-            const h = img.naturalHeight || 1080;
+            let img: HTMLImageElement;
+            if (isHeic) {
+              setImportStatus(`Converting ${file.name} (HEIC → JPEG)…`);
+              const convertedBlob = await convertHeicBlobToJpeg(file);
+              activeUrl = URL.createObjectURL(convertedBlob);
+              img = await loadImgFromUrl(activeUrl);
+            } else {
+              setImportStatus(`Loading ${file.name}…`);
+              activeUrl = URL.createObjectURL(file);
+              try {
+                img = await loadImgFromUrl(activeUrl);
+              } catch {
+                // Fallback: try server/heic conversion in case file is a misnamed HEIC/TIFF
+                URL.revokeObjectURL(activeUrl);
+                setImportStatus(`Converting ${file.name}…`);
+                const convertedBlob = await convertHeicBlobToJpeg(file);
+                activeUrl = URL.createObjectURL(convertedBlob);
+                img = await loadImgFromUrl(activeUrl);
+              }
+            }
+
+            const w = img.naturalWidth || 1440;
+            const h = img.naturalHeight || 1440;
             const analysis = analyzeMediaElement(img, w, h);
             imported.push({
               id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
               name: file.name,
               type: 'photo',
-              url,
+              url: activeUrl,
               thumbnailUrl: analysis.thumbnailUrl,
               naturalWidth: w,
               naturalHeight: h,
@@ -368,23 +537,53 @@ export function App() {
               saliencyGridSize: analysis.saliencyGridSize,
               element: img,
             });
-          } catch {
-            URL.revokeObjectURL(url);
+          } catch (err) {
+            if (activeUrl) URL.revokeObjectURL(activeUrl);
+            const reason = err instanceof Error ? err.message : String(err);
+            const msg = `Failed to import photo "${file.name}": ${reason}`;
+            console.error('[Import Error]', msg);
+            newErrors.push(msg);
           }
         } else if (isVideo) {
+          let activeUrl = URL.createObjectURL(file);
           try {
-            const vid = document.createElement('video');
-            vid.src = url;
-            vid.muted = true;
-            vid.loop = true;
-            vid.playsInline = true;
-            vid.preload = 'metadata';
-
-            await new Promise<void>((resolve, reject) => {
-              vid.onloadeddata = () => resolve();
-              vid.onerror = () => reject(new Error('Failed to load video'));
-              vid.load();
-            });
+            setImportStatus(`Loading video ${file.name}…`);
+            let vid: HTMLVideoElement;
+            try {
+              vid = await loadVideoElement(activeUrl);
+            } catch (nativeErr) {
+              // Native browser decode failed (common for iPhone HEVC / QuickTime .MOV files).
+              // Normalize to H.264 + AAC .mp4 via local dev-server ffmpeg endpoint.
+              URL.revokeObjectURL(activeUrl);
+              activeUrl = '';
+              setImportStatus(
+                `Normalizing ${file.name} to H.264 MP4 via ffmpeg…`
+              );
+              const resp = await fetch('/api/normalize-video', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/octet-stream' },
+                body: await file.arrayBuffer(),
+              });
+              if (!resp.ok) {
+                const errJson = await resp.json().catch(() => ({}));
+                throw new Error(
+                  errJson.error
+                    ? `${errJson.error}${
+                        errJson.details ? ` (${errJson.details})` : ''
+                      }`
+                    : `Native decode failed (${
+                        nativeErr instanceof Error
+                          ? nativeErr.message
+                          : String(nativeErr)
+                      }) and server /api/normalize-video returned HTTP ${
+                        resp.status
+                      }`
+                );
+              }
+              const mp4Blob = await resp.blob();
+              activeUrl = URL.createObjectURL(mp4Blob);
+              vid = await loadVideoElement(activeUrl);
+            }
 
             // Seek slightly in to capture a representative thumbnail & saliency frame
             const dur =
@@ -398,8 +597,8 @@ export function App() {
               setTimeout(resolve, 250);
             });
 
-            const w = vid.videoWidth || 1080;
-            const h = vid.videoHeight || 1350;
+            const w = vid.videoWidth || 1440;
+            const h = vid.videoHeight || 1800;
             const analysis = analyzeMediaElement(vid, w, h);
             vid.play().catch(() => {});
 
@@ -407,7 +606,7 @@ export function App() {
               id: `asset_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
               name: file.name,
               type: 'video',
-              url,
+              url: activeUrl,
               thumbnailUrl: analysis.thumbnailUrl,
               naturalWidth: w,
               naturalHeight: h,
@@ -419,12 +618,20 @@ export function App() {
               saliencyGridSize: analysis.saliencyGridSize,
               element: vid,
             });
-          } catch {
-            URL.revokeObjectURL(url);
+          } catch (err) {
+            if (activeUrl) URL.revokeObjectURL(activeUrl);
+            const reason = err instanceof Error ? err.message : String(err);
+            const msg = `Failed to import video "${file.name}": ${reason}`;
+            console.error('[Import Error]', msg);
+            newErrors.push(msg);
           }
         }
       }
 
+      setImportStatus(null);
+      if (newErrors.length > 0) {
+        setImportErrors((prev) => [...newErrors, ...prev]);
+      }
       if (imported.length > 0) {
         setAssets((prev) => [...imported, ...prev]);
       }
@@ -1905,7 +2112,7 @@ export function App() {
             ref={fileInputRef}
             id="media-file-input"
             type="file"
-            accept="image/*,video/*"
+            accept="image/*,video/*,.heic,.heif,.mov,.mp4,.m4v,.webm,.mkv,.avi"
             multiple
             style={{ display: 'none' }}
             onChange={(e) => {
@@ -1931,9 +2138,36 @@ export function App() {
           >
             <div className="dropzone-title">+ Import Photos &amp; Videos</div>
             <div className="dropzone-sub">
-              Drag &amp; drop or click to browse (JPG, PNG, WebP, MP4, MOV)
+              Drag &amp; drop or click to browse (JPG, PNG, WebP, HEIC, MP4, MOV)
             </div>
           </div>
+
+          {importStatus && (
+            <div className="import-status-banner" role="status">
+              <span className="import-spinner">⏳</span>
+              <span>{importStatus}</span>
+            </div>
+          )}
+
+          {importErrors.length > 0 && (
+            <div className="import-error-banner" role="alert">
+              <div className="import-error-header">
+                <span>⚠ Import Error ({importErrors.length})</span>
+                <button
+                  className="btn btn-sm"
+                  onClick={() => setImportErrors([])}
+                  title="Dismiss Import Errors"
+                >
+                  ✕ Dismiss
+                </button>
+              </div>
+              <ul className="import-error-list">
+                {importErrors.map((errMsg, idx) => (
+                  <li key={idx}>{errMsg}</li>
+                ))}
+              </ul>
+            </div>
+          )}
 
           <div className="asset-list">
             {assets.length === 0 && (
@@ -3862,6 +4096,16 @@ export function App() {
                             {prog.qualityUsed && prog.type === 'photo'
                               ? ` @ Q${Math.round(prog.qualityUsed * 100)}`
                               : ''}
+                          </span>
+                        )}
+                        {prog?.error && (
+                          <span
+                            style={{
+                              fontSize: 11,
+                              color: 'var(--accent-rose)',
+                            }}
+                          >
+                            ⚠ {prog.error}
                           </span>
                         )}
                       </div>
